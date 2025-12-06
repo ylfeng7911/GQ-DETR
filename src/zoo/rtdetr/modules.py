@@ -3,6 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 import torch.nn.init as init 
 import math 
+from torchvision.ops import DeformConv2d
 
 
 from .utils import deformable_attention_core_func, get_activation, inverse_sigmoid
@@ -429,6 +430,121 @@ class HLFFF(nn.Module):         #输入1是最高级特征图（调整通道）�
         return out
 
     
+
+
+
+class ChannelAttention(nn.Module):
+    """
+    通道注意力
+    """
+
+    def __init__(self, in_channels, ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+
+        self.fc = nn.Sequential(
+            # 全连接层
+            # nn.Linear(in_planes, in_planes // ratio, bias=False),
+            # nn.ReLU(), 
+            # nn.Linear(in_planes // ratio, in_planes, bias=False)
+
+            # 利用1x1卷积代替全连接，避免输入必须尺度固定的问题，并减小计算量
+            nn.Conv2d(in_channels, in_channels // ratio, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.1),                                              #添加正则化
+            nn.Conv2d(in_channels // ratio, in_channels, 1, bias=False),
+            # nn.BatchNorm2d(in_channels),
+        )
+
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+       avg_out = self.fc(self.avg_pool(x))      #[b,c,1,1] 
+       max_out = self.fc(self.max_pool(x))      #[b,c,1,1] 
+       out = avg_out + max_out
+       out = self.sigmoid(out)                  #[b,c,1,1]每个通道的权重
+       return out * x                           #每个通道按权重缩放[b,c,h,w]
+
+
+class SpatialAttention(nn.Module):
+    """
+    空间注意力
+    """
+
+    def __init__(self, kernel_size=7, dropout=0.1):
+        super(SpatialAttention, self).__init__()
+
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        padding = 3 if kernel_size == 7 else 1
+        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        #添加正则化
+        self.norm = nn.BatchNorm2d(1)  # 对每个通道/位置的值做归一化
+        self.dropout = nn.Dropout(p=dropout)
+        
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)            #[b,1,h,w]
+        max_out, _ = torch.max(x, dim=1, keepdim=True)          #[b,1,h,w]
+        out = torch.cat([avg_out, max_out], dim=1)              #[b,2,h,w]
+        out = self.conv1(out)
+        out = self.norm(out)
+        out = self.sigmoid(out)                     #[b,1,h,w]
+        out = self.dropout(out)  
+        return out * x                          #每个空间位置缩放[b,c,h,w]
+
+
+class CBAM(nn.Module):
+    """
+    CBAM混合注意力机制.作用：让模型知道特征图的哪些通道、区域是 重要/不重要，从而放大/缩小。
+    """
+
+    def __init__(self, in_channels, ratio=16, kernel_size=3, dropout=0.05):
+        super(CBAM, self).__init__()
+        self.channelattention = ChannelAttention(in_channels, ratio=ratio)
+        self.spatialattention = SpatialAttention(kernel_size=kernel_size)
+        self.dropout = nn.Dropout(p=dropout)        #添加正则化
+          
+    def forward(self, x):
+        x = self.channelattention(x)
+        x = self.spatialattention(x)
+        return self.dropout(x)
+
+
+
+class CrossScaleAlignFuse(nn.Module):
+    def __init__(self, c, deform_groups=4):
+        super().__init__()
+        self.CBAM_P2 = CBAM(256)
+        self.CBAM_P5 = CBAM(256)
+        self.deform_align = DeformConv2d(c, c, kernel_size=3, padding=1, groups=deform_groups)
+        self.offset_gen = nn.Conv2d(c, 2*3*3*deform_groups, 3, 1, 1)
+        self.gate = nn.Sequential(
+            nn.Conv2d(c*2, c, 1),
+            nn.Sigmoid()
+        )
+        self.out_proj = nn.Conv2d(c, c, 1)
+
+    def forward(self, P2, P5):
+        P2 = self.CBAM_P2(P2)
+        P5 = self.CBAM_P5(P5)
+        # 上采样P5到P2尺度
+        P5_up = F.interpolate(P5, size=P2.shape[-2:], mode='bilinear', align_corners=False)
+        offset = self.offset_gen(P2)        #希望P5对齐到P2
+        P5_aligned = self.deform_align(P5_up, offset)
+
+        # 门控融合
+        g = self.gate(torch.cat([P2, P5_aligned], dim=1))
+        fused = P2 * g + P5_aligned * (1 - g)
+        # 门控 改为 残差融合
+        # beta = 0.6
+        # fused = P2 + beta * (P5_aligned - P2)
+        return self.out_proj(fused)
+
+
+
+
 
 
 # --- 计算参数量的函数 ---

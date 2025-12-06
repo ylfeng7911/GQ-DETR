@@ -16,8 +16,8 @@ import cv2
 from .denoising import get_contrastive_denoising_training_group
 from .utils import deformable_attention_core_func, get_activation, inverse_sigmoid
 from .utils import bias_init_with_prob
-from .group_attention import grouped_self_conv,grouped_self_conv_logits,grouped_self_attn,GatedResidualBlock1d
-from .modules import MSDeformableAttention
+from .group_attention import grouped_self_conv,grouped_self_con_one_stage,GatedResidualBlock1d
+from .modules import MSDeformableAttention,CrossScaleAlignFuse
 from ...core import register
 
 
@@ -186,6 +186,7 @@ class TransformerDecoderLayer(nn.Module):
                  activation="relu",
                  n_levels=4,
                  n_points=4,
+                 CSAF_enable=True,
                  ):
         super(TransformerDecoderLayer, self).__init__()
         # self attention
@@ -195,7 +196,10 @@ class TransformerDecoderLayer(nn.Module):
         
 
         # cross attention
-        self.cross_attn = MSDeformableAttention(d_model, n_head, 1, n_points)    #n_levels
+        if CSAF_enable:
+            self.cross_attn = MSDeformableAttention(d_model, n_head, 1, n_points)    #n_levels
+        else:
+            self.cross_attn = MSDeformableAttention(d_model, n_head, n_levels, n_points)  
         self.dropout2 = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(d_model)
 
@@ -248,116 +252,26 @@ class TransformerDecoderLayer(nn.Module):
 
  
 class TransformerDecoder(nn.Module):    #参考点和偏移量全是预测得到的
-    def __init__(self, hidden_dim, decoder_layer, num_layers, eval_idx=-1, num_queries=300, topk_ratio=0.5):
+    def __init__(self, hidden_dim, decoder_layer, num_layers, eval_idx=-1, GQI_enable=True, GQI_num_layers=3):
         super(TransformerDecoder, self).__init__()
         self.layers = nn.ModuleList([copy.deepcopy(decoder_layer) for _ in range(num_layers)])
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.eval_idx = eval_idx if eval_idx >= 0 else num_layers + eval_idx
         
-        # CGA
-        self.conv_mixer = nn.ModuleList([
-            GatedResidualBlock1d(dim=256)
-            for _ in range(3)
-        ])
+        # GQI
+        self.GQI_num_layers = GQI_num_layers
+        self.GQI_enable = GQI_enable
+        if GQI_enable:
+            self.conv_mixer = nn.ModuleList([           #MSGC
+                GatedResidualBlock1d(dim=256)
+                for _ in range(self.GQI_num_layers)
+            ])
+            self.dropout = nn.Dropout(0.)
+            self.norm = nn.LayerNorm(256)
         
-        self.dropout = nn.Dropout(0.)
-        self.norm = nn.LayerNorm(256)
         
-        # #memory
-        # # 1) 全局记忆块 (Nc x C)，初始化为可学习向量；推理阶段冻结，不更新
-        # self.num_mem_blocks = 10
-        # self.mem_tau = 0.1
-        # self.mem_blocks = nn.Embedding(self.num_mem_blocks, hidden_dim)  # 10x256
-        # mem_heads = 8
-        # mem_comp_dim = 64
-        # nn.init.normal_(self.mem_blocks.weight, std=0.02)
-
-        # # 2) Memory Updater: 以 M 为Q, 以 Encoder输出 memory 为K/V 的多头注意力
-        # self.mem_update_attn = nn.MultiheadAttention(embed_dim=hidden_dim, 
-        #                                              num_heads=mem_heads, 
-        #                                              batch_first=True)
-        # # 3) Memory 融合 MLP: M_new = MLP([M, M_hat])
-        # self.mem_update_mlp = nn.Sequential(
-        #     nn.Linear(hidden_dim * 2, hidden_dim),
-        #     nn.ReLU(inplace=True),
-        #     nn.Linear(hidden_dim, hidden_dim)
-        # )
-
-        # # 4) MASA（Memory-Augmented Self-Attn）所需的投影层：
-        # #    Q_proj, K_proj, V_proj 以及 记忆分支的 Wm_k/Wm_v 与 压缩FC
-        # self.Wq = nn.Linear(hidden_dim, hidden_dim)
-        # self.Wk = nn.Linear(hidden_dim, hidden_dim)
-        # self.Wv = nn.Linear(hidden_dim, hidden_dim)
-        # self.mem_fc = nn.Linear(hidden_dim, mem_comp_dim)     # FC(M) : 256 -> 64
-        # self.Wm_k = nn.Linear(mem_comp_dim, hidden_dim)       # Wm · FC(M) -> K
-        # self.Wm_v = nn.Linear(mem_comp_dim, hidden_dim)       # Wm · FC(M) -> V
-        # self.masa_attn = nn.MultiheadAttention(embed_dim=hidden_dim, 
-        #                                        num_heads=mem_heads, 
-        #                                        batch_first=True)
-        # self.masa_norm = nn.LayerNorm(hidden_dim)
-        # self.masa_drop = nn.Dropout(0.)
-        # # =========================
         
-    def _memory_update(self, encoder_tokens, B):        #过程：M_hat = Attn(Q=M, K=U, V=U),  M_new = MLP([M, M_hat])
-        """
-        [Memory] Memory Updater
-        encoder_tokens: memory  # [B, sum_hw, C]  —— 即 Encoder 输出
-        过程：M_hat = Attn(Q=M, K=U, V=U),  M_new = MLP([M, M_hat])
-        训练阶段用 EMA 写回到 self.mem_blocks.weight；推理阶段跳过更新。
-        """
-        C = self.hidden_dim
-        # 取当前的全局记忆块 M，扩成批次维度 (B, Nc, C)
-        M = self.mem_blocks.weight.unsqueeze(0).expand(B, self.num_mem_blocks, C)  # [B, Nc, C]
-
-        # MultiHeadAttention 要求形状 [B, N, C] (batch_first=True)
-        # Q = M, K = U, V = U
-        M_hat, _ = self.mem_update_attn(query=M, key=encoder_tokens, value=encoder_tokens)  # [B, Nc, C]
-
-        # 融合：Concat(M, M_hat) -> MLP
-        M_cat = torch.cat([M, M_hat], dim=-1)            # [B, Nc, 2C]
-        M_new = self.mem_update_mlp(M_cat)               # [B, Nc, C]
-
-        # 只在训练阶段进行“在线写回”，采用EMA稳定更新到全局参数表
-        if self.training:
-            with torch.no_grad():
-                # 跨 batch 合并（取平均）再EMA写回
-                M_batch_mean = M_new.mean(dim=0)         # [Nc, C]
-                self.mem_blocks.weight.data.mul_(1 - self.mem_tau).add_(self.mem_tau * M_batch_mean.data)
-
-        # 返回本次前向用于 MASA 的记忆快照（不影响梯度流向 mem_blocks 权重）
-        return M_new.detach()    # 解码器使用该快照；全局权重已在上面 EMA 写回
-
-    def _masa(self, Q, M_snapshot, B):  #查询和M交互
-        """
-        [Memory] MASA：用记忆增强自注意力（替代/增强原Self-Attention）。
-        K = [Wk Q,  Wm · FC(M)],  V = [Wv Q,  Wm · FC(M)],  Q' = Wq Q
-        Q: [B, Nq, C]
-        M_snapshot: [B, Nc, C] (来自 _memory_update 返回的本批记忆快照)
-        返回：MASA后的输出 (做残差+Norm)
-        """
-        # Q/K/V 投影
-        Qq = self.Wq(Q)                      # [B, Nq, C]
-        Kq = self.Wk(Q)                      # [B, Nq, C]
-        Vq = self.Wv(Q)                      # [B, Nq, C]
-
-        # 记忆分支：FC 压缩 -> Wm 投影
-        M_comp = self.mem_fc(M_snapshot)     # [B, Nc, 64]
-        Mk = self.Wm_k(M_comp)               # [B, Nc, C]
-        Mv = self.Wm_v(M_comp)               # [B, Nc, C]
-
-        # 拼接得到 K/V
-        K = torch.cat([Kq, Mk], dim=1)       # [B, Nq + Nc, C]
-        V = torch.cat([Vq, Mv], dim=1)       # [B, Nq + Nc, C]
-
-        # 多头注意力（batch_first）
-        masa_out, _ = self.masa_attn(Qq, K, V)   # [B, Nq, C]
-
-        # 残差 & 归一化
-        out = self.masa_norm(Q + self.masa_drop(masa_out))
-        return out
-    
-    
     def forward(self,
                 tgt,                #合并后的[b,500,256]        在解码器中一直是 嵌入 的身份
                 ref_points_unact,   #合并后的[b,500,4]          在解码器中一直是 坐标预测（参考点） 的身份
@@ -383,12 +297,11 @@ class TransformerDecoder(nn.Module):    #参考点和偏移量全是预测得到
             query_pos_embed = query_pos_head(ref_points_detach)     #[b,500,4] -> [b,500,256]表示query的位置嵌入,
             
             # output[:, -300:, :] = self._masa(output[:, -300:, :], M_snapshot, B) 
-            if i >= 3:
+            if i >= 6 - self.GQI_num_layers and self.GQI_enable:
                 group_logits = score_head[i](output)
                 if i==0:
                     inter_ref_bbox =  F.sigmoid(bbox_head[i](output) + inverse_sigmoid(ref_points_detach)) #预测框
-                output2  = grouped_self_conv(output,group_logits, self.conv_mixer[i-3], inter_ref_bbox, 300)
-                
+                output2  = grouped_self_conv(output,group_logits, self.conv_mixer[i- 6 + self.GQI_num_layers], inter_ref_bbox, 300)
                 output = output + self.dropout(output2)
                 output = self.norm(output)
 
@@ -445,6 +358,9 @@ class RTDETRTransformer(nn.Module):
                  learnt_init_query=False,
                  eval_spatial_size=None,
                  eval_idx=-1,
+                 GQI_enable=True,
+                 GQI_num_layers=3,
+                 CSAF_enable=True,
                  eps=1e-2, 
                  aux_loss=True,
                  version='v1'):
@@ -472,8 +388,8 @@ class RTDETRTransformer(nn.Module):
         self._build_input_proj_layer(feat_channels)
 
         # Transformer module
-        decoder_layer = TransformerDecoderLayer(hidden_dim, nhead, dim_feedforward, dropout, activation, num_levels, num_points)
-        self.decoder = TransformerDecoder(hidden_dim, decoder_layer, num_layers, eval_idx)
+        decoder_layer = TransformerDecoderLayer(hidden_dim, nhead, dim_feedforward, dropout, activation, num_levels, num_points, CSAF_enable)
+        self.decoder = TransformerDecoder(hidden_dim, decoder_layer, num_layers, eval_idx, GQI_enable, GQI_num_layers)
 
         self.num_denoising = num_denoising
         self.label_noise_ratio = label_noise_ratio
@@ -520,7 +436,9 @@ class RTDETRTransformer(nn.Module):
             self.anchors, self.valid_mask = self._generate_anchors()
 
         # 最大特征图
-
+        self.CSAF_enable = CSAF_enable
+        if CSAF_enable:
+            self.Fuse = CrossScaleAlignFuse(256)
         
         self._reset_parameters()
 
@@ -679,11 +597,6 @@ class RTDETRTransformer(nn.Module):
         # input projection and embedding
         (memory, spatial_shapes, level_start_index) = self._get_encoder_input(feats)    #展平特征图和2列表
         
-        b,c,h,w = feat_max.shape
-        feat_max =  feat_max.permute(0, 2, 3, 1).reshape(b, h * w, c)            #[b,hw,c]
-        spatial_shapes_max = [[h,w]]
-        level_start_index_max = 0
-        
         # prepare denoising training
         if self.training and self.num_denoising > 0:
             denoising_class, denoising_bbox_unact, attn_mask, dn_meta = \
@@ -700,19 +613,28 @@ class RTDETRTransformer(nn.Module):
         target, init_ref_points_unact, enc_topk_bboxes, enc_topk_logits = \
             self._get_decoder_input(memory, spatial_shapes, denoising_class, denoising_bbox_unact)  #解码器输入    
 
+        # CSAF 极尺度融合
+        if self.CSAF_enable:
+            feat_fuse = self.Fuse(feat_max,feats[-1])
+            b,c,h,w = feat_fuse.shape
+            memory =  feat_fuse.permute(0, 2, 3, 1).reshape(b, h * w, c)            #[b,hw,c]
+            spatial_shapes = [[h,w]]
+            level_start_index = 0
+            
         # decoder
         out_bboxes, out_logits = self.decoder(                  #[6,b,500,4],[6,b,500,2]
             target,                 #合并后的类别查询
             init_ref_points_unact,  #合并后的bbox查询
-            feat_max,             #memory
-            spatial_shapes_max,
-            level_start_index_max,
+            memory,             #memory
+            spatial_shapes,
+            level_start_index,
             self.dec_bbox_head,     #bbox预测 MLP
             self.dec_score_head,    #类别预测 线性层
             self.query_pos_head,    #MLP
             attn_mask=attn_mask,
             samples= samples,
-            targets = targets)
+            targets = targets,
+            )
 
         if self.training and dn_meta is not None:
             dn_out_bboxes, out_bboxes = torch.split(out_bboxes, dn_meta['dn_num_split'], dim=2)     #分成[6,b,300,4]和[6,b,200,4]

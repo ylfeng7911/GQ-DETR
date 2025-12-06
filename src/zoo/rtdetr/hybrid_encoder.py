@@ -457,27 +457,7 @@ class HybridEncoder(nn.Module):
                 CSPRepLayer(hidden_dim * 2, hidden_dim, round(3 * depth_mult), act=act, expansion=expansion)        #C减半,H/W不变
             )
             
-        #CBAM,ASFF
-        # self.CBAM_block = nn.ModuleList([CBAM(256) for i,ch in enumerate(in_channels)])
-        # self.ASFF_block = nn.ModuleList([ASFF3(0),ASFF3(1),ASFF3(2)])     #ASFF_block的顺序是从高到低  
-        
-        # self.BiFPN_block = BiFPN([256,256,256], 256)
-        # self.SK = SK_block()
-        
-        # HLFFF
-        # self.HLFFF_block1 = HLFFF(256)
-        # self.HLFFF_block2 = HLFFF(256)
-        # self.HLFFF_downSample2 = nn.Sequential(
-        #     ConvNormLayer(hidden_dim, hidden_dim, 3, 2, act=act),
-        #     DSConv(hidden_dim, hidden_dim, 3, 2, act=act)
-        #     )
 
-        # self.HLFFF_downSample1 = ConvNormLayer(hidden_dim, hidden_dim, 3, 2, act=act)
-        
-        
-        # self.HLFFF_block0 = HLFFF(256)
-        # self.HLFFF_proj = ConvNormLayer(hidden_dim * 2, hidden_dim, 1, 1)
-        
         
         self._reset_parameters()
 
@@ -550,24 +530,6 @@ class HybridEncoder(nn.Module):
             out = self.pan_blocks[idx](torch.concat([downsample_feat, feat_height], dim=1)) #concat再减半C
             outs.append(out)
 
-        # CBAM_outs = [self.CBAM_block[i](outs[i]) for i in range(len(self.in_channels))]  #（尺度从下往上) 
-        # ASFF_outs = [self.ASFF_block[i](CBAM_outs[2], CBAM_outs[1], CBAM_outs[0]) for i in range(len(self.in_channels))] #尺度从小到大
-        # ASFF_outs.reverse()
 
-        # CBAM_outs = [self.CBAM_block[i](inner_outs[i]) for i in range(len(self.in_channels))]  #（尺度从下往上) 
-        # ASFF_outs = [self.ASFF_block[i](outs[2], outs[1], outs[0]) for i in range(len(self.in_channels))] #尺度从小到大
-        # ASFF_outs.reverse()
-
-        # outs = inner_outs
-        #  HLFFF 替换out1,out2
-        # outs0_down1 = self.HLFFF_downSample1(outs[0])
-        # outs[1] = self.HLFFF_block1(outs[1],outs0_down1)
-        
-        # outs0_down2 = self.HLFFF_downSample2(outs[0])
-        # outs[2] = self.HLFFF_block2(outs[2],outs0_down2)
-        
-        
-        # outs_fuse = self.HLFFF_proj(torch.cat([outs[1], F.interpolate(outs[2], scale_factor=2., mode='nearest')], dim = 1))
-        # outs[0] = self.HLFFF_block0(outs[0],F.interpolate(outs_fuse, scale_factor=2., mode='nearest'))
         return outs            #尺度从大到小
 

@@ -238,136 +238,133 @@ def kmeans_torch(x, K=2, num_iters=10, eps=1e-6, seed=0):
 
 
 # 单阶段版本
-# def grouped_self_conv(
-#     tgt,                       # [B, Q, C]
-#     enc_topk_logits,           # [B, Q, num_classes]
-#     conv_mixer,
-#     num_queries=300,
-#     K=2,                       # 聚类簇数
-#     kmeans_iters=10,
-#     min_keep=10,
-#     min_keep_bg=1,
-#     use_pos=False,
-#     ref_points=None,
-#     use_sklearn=False,
-# ):
-#     """
-#     基于聚类的分组卷积交互：
-#     - 在 tgt 的最后 num_queries 个 queries 上做聚类
-#     - 用 enc_topk_logits 的平均前景概率判定前/背景簇
-#     - 对每个簇做 1D 卷积交互
-#     """
-#     B, Q, C = tgt.shape
-#     device = tgt.device
-#     M = num_queries
+def grouped_self_con_one_stage(
+    tgt,                       # [B, Q, C]
+    enc_topk_logits,           # [B, Q, num_classes]
+    conv_mixer,
+    ref_boxes,
+    num_queries=300,
+    K=2,                       # 聚类簇数
+    kmeans_iters=10,
+    min_keep=1,
+    min_keep_bg=1,
+):
+    """
+    基于聚类的分组卷积交互：
+    - 在 tgt 的最后 num_queries 个 queries 上做聚类
+    - 用 enc_topk_logits 的平均前景概率判定前/背景簇
+    - 对每个簇做 1D 卷积交互
+    """
+    B, Q, C = tgt.shape
+    device = tgt.device
+    M = num_queries
 
-#     tgt0 = tgt[:, -M:, :].contiguous()
-#     logits0 = enc_topk_logits[:, -M:, :].contiguous()
+    tgt0 = tgt[:, -M:, :].contiguous()
+    logits0 = enc_topk_logits[:, -M:, :].contiguous()
 
-#     if logits0.shape[-1] == 1:
-#         scores_all = torch.sigmoid(logits0.view(B, M))
-#     else:
-#         probs = torch.softmax(logits0, dim=-1)
-#         fg_idx = 1 if logits0.shape[-1] > 1 else 0
-#         scores_all = probs[..., fg_idx]
+    if logits0.shape[-1] == 1:
+        scores_all = torch.sigmoid(logits0.view(B, M))
+    else:
+        fg_idx = 1
+        scores_all = torch.sigmoid(logits0[..., fg_idx])
 
-#     tgt0_new = torch.zeros_like(tgt0)
+    tgt0_new = torch.zeros_like(tgt0)
 
-#     tgt_fg_list, tgt_bg_list = [], []
-#     idx_fg_list, idx_bg_list = [], []
-#     len_fg_list, len_bg_list = [], []
+    tgt_fg_list, tgt_bg_list = [], []
+    idx_fg_list, idx_bg_list = [], []
+    len_fg_list, len_bg_list = [], []
 
-#     #每个样本：做聚类，得到前后景tgt列表、前后景idx列表
-#     for b in range(B):
-#         x = tgt0[b]
-#         feats = F.normalize(x.detach(), p=2, dim=1)
+    #每个样本：做聚类，得到前后景tgt列表、前后景idx列表
+    for b in range(B):
+        x = tgt0[b]
+        feats = F.normalize(x.detach(), p=2, dim=1)
 
-#         K_b = min(K, max(1, M))
-#         labels, centers = kmeans_torch(feats, K=K_b, num_iters=kmeans_iters, seed=b+1)  
+        K_b = min(K, max(1, M))
+        labels, centers = kmeans_torch(feats, K=K_b, num_iters=kmeans_iters, seed=b+1)  
 
-#         cluster_scores = []
-#         for k in range(K_b):
-#             mask_k = (labels == k)
-#             if mask_k.sum() == 0:
-#                 cluster_scores.append(torch.tensor(-1.0, device=device))
-#             else:
-#                 cluster_scores.append(scores_all[b][mask_k].mean().detach())
-#         cluster_scores = torch.stack(cluster_scores)
+        cluster_scores = []
+        for k in range(K_b):
+            mask_k = (labels == k)
+            if mask_k.sum() == 0:
+                cluster_scores.append(torch.tensor(-1.0, device=device))
+            else:
+                cluster_scores.append(scores_all[b][mask_k].mean().detach())
+        cluster_scores = torch.stack(cluster_scores)
 
-#         fg_cluster_idx = int(torch.argmax(cluster_scores).item())
-#         fg_mask_b = (labels == fg_cluster_idx)
-#         bg_mask_b = ~fg_mask_b
+        fg_cluster_idx = int(torch.argmax(cluster_scores).item())
+        fg_mask_b = (labels == fg_cluster_idx)
+        bg_mask_b = ~fg_mask_b
 
-#         if fg_mask_b.sum() < min_keep:
-#             _, topk_idx = torch.topk(scores_all[b], min(min_keep, M), dim=0)
-#             new_fg = torch.zeros_like(fg_mask_b)
-#             new_fg[topk_idx] = True
-#             fg_mask_b = new_fg
-#             bg_mask_b = ~fg_mask_b
+        if fg_mask_b.sum() < min_keep:
+            _, topk_idx = torch.topk(scores_all[b], min(min_keep, M), dim=0)
+            new_fg = torch.zeros_like(fg_mask_b)
+            new_fg[topk_idx] = True
+            fg_mask_b = new_fg
+            bg_mask_b = ~fg_mask_b
 
-#         if bg_mask_b.sum() < min_keep_bg:
-#             lowest = torch.argmin(scores_all[b])
-#             bg_mask_b[lowest] = True
-#             fg_mask_b[lowest] = False
+        if bg_mask_b.sum() < min_keep_bg:
+            lowest = torch.argmin(scores_all[b])
+            bg_mask_b[lowest] = True
+            fg_mask_b[lowest] = False
 
-#         idx_fg = torch.nonzero(fg_mask_b, as_tuple=False).squeeze(-1)
-#         idx_bg = torch.nonzero(bg_mask_b, as_tuple=False).squeeze(-1)
-#         tgt_fg = x[idx_fg] if idx_fg.numel() > 0 else x.new_zeros((0, C))
-#         tgt_bg = x[idx_bg] if idx_bg.numel() > 0 else x.new_zeros((0, C))
+        idx_fg = torch.nonzero(fg_mask_b, as_tuple=False).squeeze(-1)
+        idx_bg = torch.nonzero(bg_mask_b, as_tuple=False).squeeze(-1)
+        tgt_fg = x[idx_fg] if idx_fg.numel() > 0 else x.new_zeros((0, C))
+        tgt_bg = x[idx_bg] if idx_bg.numel() > 0 else x.new_zeros((0, C))
 
-#         tgt_fg_list.append(tgt_fg)
-#         tgt_bg_list.append(tgt_bg)
-#         idx_fg_list.append(idx_fg)
-#         idx_bg_list.append(idx_bg)
-#         len_fg_list.append(tgt_fg.size(0))
-#         len_bg_list.append(tgt_bg.size(0))
+        tgt_fg_list.append(tgt_fg)
+        tgt_bg_list.append(tgt_bg)
+        idx_fg_list.append(idx_fg)
+        idx_bg_list.append(idx_bg)
+        len_fg_list.append(tgt_fg.size(0))
+        len_bg_list.append(tgt_bg.size(0))
 
-#     #分别对前后景：每个样本对应的tgt补零到batch中的最长长度
-#     max_fg = max(len_fg_list) if len_fg_list else 0
-#     max_bg = max(len_bg_list) if len_bg_list else 0
+    #分别对前后景：每个样本对应的tgt补零到batch中的最长长度
+    max_fg = max(len_fg_list) if len_fg_list else 0
+    max_bg = max(len_bg_list) if len_bg_list else 0
 
-#     def pad_group_list(group_list, max_len):
-#         padded = []
-#         for x in group_list:
-#             cur = x
-#             pad = max_len - cur.size(0)
-#             if pad == 0:
-#                 padded.append(cur)
-#             else:
-#                 if cur.size(0) == 0:
-#                     padded.append(cur.new_zeros((max_len, C)))
-#                 else:
-#                     padded.append(F.pad(cur, (0, 0, 0, pad)))
-#         return torch.stack(padded, dim=0) if len(padded) > 0 else tgt0.new_zeros((B, 0, C))
+    def pad_group_list(group_list, max_len):
+        padded = []
+        for x in group_list:
+            cur = x
+            pad = max_len - cur.size(0)
+            if pad == 0:
+                padded.append(cur)
+            else:
+                if cur.size(0) == 0:
+                    padded.append(cur.new_zeros((max_len, C)))
+                else:
+                    padded.append(F.pad(cur, (0, 0, 0, pad)))
+        return torch.stack(padded, dim=0) if len(padded) > 0 else tgt0.new_zeros((B, 0, C))
 
-#     padded_tgt_fg = pad_group_list(tgt_fg_list, max_fg) if max_fg > 0 else tgt0.new_zeros((B, 0, C))
-#     padded_tgt_bg = pad_group_list(tgt_bg_list, max_bg) if max_bg > 0 else tgt0.new_zeros((B, 0, C))
+    padded_tgt_fg = pad_group_list(tgt_fg_list, max_fg) if max_fg > 0 else tgt0.new_zeros((B, 0, C))
+    padded_tgt_bg = pad_group_list(tgt_bg_list, max_bg) if max_bg > 0 else tgt0.new_zeros((B, 0, C))
 
-#     if max_fg > 0:
-#         lengths_fg = torch.tensor(len_fg_list, device=device)
-#         key_pad_fg = (torch.arange(max_fg, device=device).unsqueeze(0).expand(B, -1) >= lengths_fg.unsqueeze(1)).to(torch.bool)#掩码，T表示pad部分
-#         padded_tgt_fg_after = conv_mixer(padded_tgt_fg, key_padding_mask=key_pad_fg)
-#     else:
-#         padded_tgt_fg_after = padded_tgt_fg
+    if max_fg > 0:
+        lengths_fg = torch.tensor(len_fg_list, device=device)
+        key_pad_fg = (torch.arange(max_fg, device=device).unsqueeze(0).expand(B, -1) >= lengths_fg.unsqueeze(1)).to(torch.bool)#掩码，T表示pad部分
+        padded_tgt_fg_after = conv_mixer(padded_tgt_fg, key_padding_mask=key_pad_fg)
+    else:
+        padded_tgt_fg_after = padded_tgt_fg
 
-#     if max_bg > 0:
-#         lengths_bg = torch.tensor(len_bg_list, device=device)
-#         key_pad_bg = (torch.arange(max_bg, device=device).unsqueeze(0).expand(B, -1) >= lengths_bg.unsqueeze(1)).to(torch.bool)
-#         padded_tgt_bg_after = conv_mixer(padded_tgt_bg, key_padding_mask=key_pad_bg)
-#         padded_tgt_bg_after = padded_tgt_bg
-#     else:
-#         padded_tgt_bg_after = padded_tgt_bg
+    if max_bg > 0:
+        lengths_bg = torch.tensor(len_bg_list, device=device)
+        key_pad_bg = (torch.arange(max_bg, device=device).unsqueeze(0).expand(B, -1) >= lengths_bg.unsqueeze(1)).to(torch.bool)
+        padded_tgt_bg_after = conv_mixer(padded_tgt_bg, key_padding_mask=key_pad_bg)
+        padded_tgt_bg_after = padded_tgt_bg
+    else:
+        padded_tgt_bg_after = padded_tgt_bg
 
-#     for b in range(B):
-#         lf = len_fg_list[b]
-#         lb = len_bg_list[b]
-#         if lf > 0:
-#             tgt0_new[b, idx_fg_list[b]] = padded_tgt_fg_after[b, :lf]
-#         if lb > 0:
-#             tgt0_new[b, idx_bg_list[b]] = padded_tgt_bg_after[b, :lb]
+    for b in range(B):
+        lf = len_fg_list[b]
+        lb = len_bg_list[b]
+        if lf > 0:
+            tgt0_new[b, idx_fg_list[b]] = padded_tgt_fg_after[b, :lf]
+        if lb > 0:
+            tgt0_new[b, idx_bg_list[b]] = padded_tgt_bg_after[b, :lb]
 
-#     tgt_new = torch.cat([tgt[:, :-M, :], tgt0_new], dim=1)
-#     return tgt_new
+    tgt_new = torch.cat([tgt[:, :-M, :], tgt0_new], dim=1)
+    return tgt_new
 
 
 
@@ -400,9 +397,8 @@ def grouped_self_conv(
     if logits0.shape[-1] == 1:
         scores_all = torch.sigmoid(logits0.view(B, M))
     else:
-        probs = torch.softmax(logits0, dim=-1)              #用的softmax处理
-        fg_idx = 1 if logits0.shape[-1] > 1 else 0
-        scores_all = probs[..., fg_idx]
+        fg_idx = 1
+        scores_all = torch.sigmoid(logits0[..., fg_idx])
 
     tgt0_new = torch.zeros_like(tgt0)
 
